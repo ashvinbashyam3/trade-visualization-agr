@@ -57,23 +57,9 @@ export default function Dashboard() {
     // Filter history for charts: From First Trade Date to Last Trade Date + Buffer
     const chartHistory = useMemo(() => {
         if (!currentPosition || !data) return [];
-
-        const trades = currentPosition.trades;
-        if (trades.length === 0) return currentPosition.history;
-
-        const firstTradeTime = new Date(trades[0].tradeDate).getTime();
-        const lastTradeTime = new Date(trades[trades.length - 1].tradeDate).getTime();
-
-        const duration = lastTradeTime - firstTradeTime;
-        const buffer = duration * 0.01; // 1% buffer
-
-        const startTime = firstTradeTime - buffer;
-        const endTime = lastTradeTime + buffer;
-
-        return currentPosition.history.filter(h => {
-            const d = new Date(h.date).getTime();
-            return d >= startTime && d <= endTime;
-        });
+        // Use the pre-calculated history from the parser, which already handles 
+        // the full ownership range (Trade dates + History sheet dates) and buffering.
+        return currentPosition.history;
     }, [currentPosition, data]);
 
     if (!data) {
