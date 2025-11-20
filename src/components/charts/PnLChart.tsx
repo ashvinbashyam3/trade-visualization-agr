@@ -18,6 +18,25 @@ interface PnLChartProps {
 export const PnLChart: React.FC<PnLChartProps> = ({ position }) => {
     const data = position.history;
 
+    // Calculate max absolute value to determine units
+    const maxValue = Math.max(
+        ...data.map(d => Math.max(
+            Math.abs(d.totalPnL),
+            Math.abs(d.realizedPnL),
+            Math.abs(d.unrealizedPnL)
+        ))
+    );
+
+    const useMillions = maxValue >= 1000000;
+
+    const formatYAxis = (val: number) => {
+        if (val === 0) return '$0';
+        if (useMillions) {
+            return `$${(val / 1000000).toFixed(1)}M`;
+        }
+        return `$${(val / 1000).toFixed(0)}k`;
+    };
+
     return (
         <div className="h-[400px] w-full bg-white p-4 rounded-xl shadow-sm border border-gray-100">
             <h3 className="text-lg font-semibold text-gray-800 mb-4">P&L Over Time</h3>
@@ -33,7 +52,7 @@ export const PnLChart: React.FC<PnLChartProps> = ({ position }) => {
                     <YAxis
                         stroke="#9ca3af"
                         fontSize={12}
-                        tickFormatter={(val) => `$${(val / 1000).toFixed(0)}k`}
+                        tickFormatter={formatYAxis}
                     />
                     <Tooltip
                         content={({ active, payload, label }) => {

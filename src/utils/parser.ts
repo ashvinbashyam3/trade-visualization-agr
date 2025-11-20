@@ -237,6 +237,7 @@ export const parseTradeData = async (file: File): Promise<DashboardData> => {
 
     const dailyAumMap: Record<string, number> = {};
     const dailyPriceMap: Record<string, Record<string, number>> = {}; // Date -> Ticker -> Price
+    const lastHistoryDateMap: Record<string, string> = {}; // Ticker -> Last Date seen in History
     const historyDates = new Set<string>();
 
     if (histSheetName) {
@@ -294,6 +295,14 @@ export const parseTradeData = async (file: File): Promise<DashboardData> => {
                     let val = row[qtyCol];
                     if (typeof val === 'string') val = parseFloat(val.replace(/[$,()]/g, '')) || 0;
                     if (typeof val === 'number') qty = val;
+                }
+
+                // Update Last History Date if position exists
+                if (Math.abs(qty) > 0.000001 || Math.abs(mv) > 0.01) {
+                    const curLast = lastHistoryDateMap[ticker] || '';
+                    if (date > curLast) {
+                        lastHistoryDateMap[ticker] = date;
+                    }
                 }
 
                 // --- ARGX Special Handling ---
@@ -380,7 +389,7 @@ export const parseTradeData = async (file: File): Promise<DashboardData> => {
         maxSizePercentAUM: number;
     }> = {};
 
-    allDates.forEach(date => {
+    allDates.forEach((date, dateIdx) => {
         // A. Process Trades for this date
         const daysTrades = tradesByDate[date] || [];
 
@@ -401,6 +410,27 @@ export const parseTradeData = async (file: File): Promise<DashboardData> => {
                         daysPresent: 0,
                         maxSizePercentAUM: 0
                     };
+
+                    // --- ADD START BUFFER ---
+                    // Add a data point for the day BEFORE the first trade, if possible.
+                    if (dateIdx > 0) {
+                        const prevDate = allDates[dateIdx - 1];
+                        let startPrice = trade.price;
+                        // Try to get historical price for the buffer day to avoid scaling issues
+                        if (dailyPriceMap[prevDate] && dailyPriceMap[prevDate][trade.ticker]) {
+                            startPrice = dailyPriceMap[prevDate][trade.ticker];
+                        }
+
+                        positionStates[trade.ticker].history.push({
+                            date: prevDate,
+                            price: startPrice,
+                            shares: 0,
+                            avgCostBasis: 0,
+                            realizedPnL: 0,
+                            unrealizedPnL: 0,
+                            totalPnL: 0
+                        });
+                    }
                 }
 
                 const holding = currentHoldings[trade.ticker];
@@ -570,7 +600,36 @@ export const parseTradeData = async (file: File): Promise<DashboardData> => {
         pos.totalPnL = pos.realizedPnL + pos.unrealizedPnL;
 
         pos.trades = trades.filter(t => t.ticker === ticker);
-        pos.history = posState.history;
+
+        // --- TRIM HISTORY ---
+        // Find the last index where shares != 0
+        let lastActiveIndex = -1;
+        for (let i = posState.history.length - 1; i >= 0; i--) {
+            if (Math.abs(posState.history[i].shares) > 0.000001) {
+                lastActiveIndex = i;
+                break;
+            }
+        }
+
+        // Also check Last History Date (from History Sheet)
+        // If the History sheet says we held it on date X, we must include date X.
+        let lastHistoryIndex = -1;
+        const lastHistDate = lastHistoryDateMap[ticker];
+        if (lastHistDate) {
+            lastHistoryIndex = posState.history.findIndex(h => h.date === lastHistDate);
+        }
+
+        // The cut-off should be the MAX of (Last Active Trade-based Index) and (Last History-based Index)
+        const finalIndex = Math.max(lastActiveIndex, lastHistoryIndex);
+
+        if (finalIndex >= 0) {
+            const sliceEnd = Math.min(posState.history.length, finalIndex + 2);
+            pos.history = posState.history.slice(0, sliceEnd);
+        } else {
+            // If never active and no history?
+            pos.history = posState.history;
+        }
+
         pos.maxSizePercentAUM = posState.maxSizePercentAUM;
         pos.avgSizePercentAUM = posState.daysPresent > 0 ? posState.sumSizePercentAUM / posState.daysPresent : 0;
 
