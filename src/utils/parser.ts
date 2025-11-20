@@ -261,7 +261,7 @@ const consolidateArgxTrades = (trades: Trade[]): Trade[] => {
 /**
  * Parses the History Sheet to extract daily AUM, prices, and the last seen date for each ticker.
  * @param workbook - The Excel workbook.
- * @returns Object containing dailyAumMap, dailyPriceMap, lastHistoryDateMap, and historyDates set.
+ * @returns Object containing dailyAumMap, dailyPriceMap, lastHistoryDateMap, firstHistoryDateMap, and historyDates set.
  */
 const parseHistorySheet = (workbook: WorkBook) => {
     const histSheetName = workbook.SheetNames.find(n =>
@@ -273,6 +273,7 @@ const parseHistorySheet = (workbook: WorkBook) => {
     const dailyAumMap: Record<string, number> = {};
     const dailyPriceMap: Record<string, Record<string, number>> = {};
     const lastHistoryDateMap: Record<string, string> = {};
+    const firstHistoryDateMap: Record<string, string> = {};
     const historyDates = new Set<string>();
 
     if (histSheetName) {
@@ -293,6 +294,7 @@ const parseHistorySheet = (workbook: WorkBook) => {
 
             histJson.forEach(row => {
                 if (!dateCol || !row[dateCol]) return;
+                if (!tickerCol) return; // Ensure tickerCol is defined
                 const date = parseExcelDate(row[dateCol]);
                 if (!date) return;
 
@@ -310,11 +312,17 @@ const parseHistorySheet = (workbook: WorkBook) => {
                 const price = priceCol ? parseFinancialNumber(row[priceCol]) : 0;
                 const qty = qtyCol ? parseFinancialNumber(row[qtyCol]) : 0;
 
-                // Update Last History Date if position exists
+                // Update History Dates if position exists
                 if (Math.abs(qty) > 0.000001 || Math.abs(mv) > 0.01) {
+                    // Update Last Date
                     const curLast = lastHistoryDateMap[ticker] || '';
                     if (date > curLast) {
                         lastHistoryDateMap[ticker] = date;
+                    }
+                    // Update First Date
+                    const curFirst = firstHistoryDateMap[ticker];
+                    if (!curFirst || date < curFirst) {
+                        firstHistoryDateMap[ticker] = date;
                     }
                 }
 
@@ -365,7 +373,7 @@ const parseHistorySheet = (workbook: WorkBook) => {
             });
         }
     }
-    return { dailyAumMap, dailyPriceMap, lastHistoryDateMap, historyDates };
+    return { dailyAumMap, dailyPriceMap, lastHistoryDateMap, firstHistoryDateMap, historyDates };
 };
 
 /**
@@ -578,7 +586,8 @@ const finalizePositions = (
     positionStates: Record<string, any>,
     currentHoldings: Record<string, any>,
     trades: Trade[],
-    lastHistoryDateMap: Record<string, string>
+    lastHistoryDateMap: Record<string, string>,
+    firstHistoryDateMap: Record<string, string>
 ): Position[] => {
     const positionsMap: Record<string, Position> = {};
 
@@ -619,29 +628,49 @@ const finalizePositions = (
 
         pos.trades = trades.filter(t => t.ticker === ticker);
 
-        // --- TRIM HISTORY ---
-        // Find the last index where shares != 0
-        let lastActiveIndex = -1;
-        for (let i = posState.history.length - 1; i >= 0; i--) {
-            if (Math.abs(posState.history[i].shares) > 0.000001) {
-                lastActiveIndex = i;
-                break;
+        // --- DETERMINE X-AXIS BOUNDS ---
+        // 1. Find Trade Bounds
+        let firstTradeDate = '';
+        let lastTradeDate = '';
+        if (pos.trades.length > 0) {
+            firstTradeDate = pos.trades[0].tradeDate;
+            lastTradeDate = pos.trades[pos.trades.length - 1].tradeDate;
+        }
+
+        // 2. Find History Bounds
+        const firstHistDate = firstHistoryDateMap[ticker] || '';
+        const lastHistDate = lastHistoryDateMap[ticker] || '';
+
+        // 3. Calculate Union Bounds
+        // Start: Earliest of Trade or History
+        let startDate = firstTradeDate;
+        if (firstHistDate && (!startDate || firstHistDate < startDate)) {
+            startDate = firstHistDate;
+        }
+
+        // End: Latest of Trade or History
+        let endDate = lastTradeDate;
+        if (lastHistDate && (!endDate || lastHistDate > endDate)) {
+            endDate = lastHistDate;
+        }
+
+        // 4. Slice History
+        if (startDate && endDate) {
+            const startIndex = posState.history.findIndex((h: any) => h.date === startDate);
+            const endIndex = posState.history.findIndex((h: any) => h.date === endDate);
+
+            // Apply 1-day buffer if possible (visual padding)
+            const sliceStart = Math.max(0, startIndex - 1);
+            const sliceEnd = Math.min(posState.history.length, endIndex + 2);
+
+            if (startIndex >= 0 && endIndex >= 0) {
+                pos.history = posState.history.slice(sliceStart, sliceEnd);
+            } else {
+                // Fallback if dates not found in master timeline (unlikely)
+                pos.history = posState.history;
             }
-        }
-
-        // Also check Last History Date (from History Sheet)
-        let lastHistoryIndex = -1;
-        const lastHistDate = lastHistoryDateMap[ticker];
-        if (lastHistDate) {
-            lastHistoryIndex = posState.history.findIndex((h: any) => h.date === lastHistDate);
-        }
-
-        const finalIndex = Math.max(lastActiveIndex, lastHistoryIndex);
-
-        if (finalIndex >= 0) {
-            const sliceEnd = Math.min(posState.history.length, finalIndex + 2);
-            pos.history = posState.history.slice(0, sliceEnd);
         } else {
+            // No data?
             pos.history = posState.history;
         }
 
@@ -677,7 +706,7 @@ export const parseTradeData = async (file: File): Promise<DashboardData> => {
     trades = consolidateArgxTrades(trades);
 
     // 2. Parse History Sheet
-    const { dailyAumMap, dailyPriceMap, lastHistoryDateMap, historyDates } = parseHistorySheet(workbook);
+    const { dailyAumMap, dailyPriceMap, lastHistoryDateMap, firstHistoryDateMap, historyDates } = parseHistorySheet(workbook);
 
     // 3. Build Master Timeline
     const tradeDates = new Set(trades.map(t => t.tradeDate));
@@ -693,7 +722,7 @@ export const parseTradeData = async (file: File): Promise<DashboardData> => {
     );
 
     // 5. Finalize Positions
-    const positions = finalizePositions(positionStates, currentHoldings, trades, lastHistoryDateMap);
+    const positions = finalizePositions(positionStates, currentHoldings, trades, lastHistoryDateMap, firstHistoryDateMap);
 
     return {
         positions,

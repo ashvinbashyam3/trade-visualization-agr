@@ -102,7 +102,7 @@ export default function Dashboard() {
                 <div className="p-6 border-b border-gray-100">
                     <h1 className="text-xl font-bold text-gray-900 flex items-center gap-2">
                         <LayoutDashboard className="w-6 h-6 text-blue-600" />
-                        TradeViz
+                        TradeVis
                     </h1>
                 </div>
 
@@ -125,8 +125,8 @@ export default function Dashboard() {
                                 key={pos.ticker}
                                 onClick={() => setSelectedTicker(pos.ticker)}
                                 className={`w-full text-left px-3 py-2 rounded-lg text-sm font-medium transition-colors ${selectedTicker === pos.ticker
-                                        ? 'bg-blue-50 text-blue-700'
-                                        : 'text-gray-600 hover:bg-gray-50'
+                                    ? 'bg-blue-50 text-blue-700'
+                                    : 'text-gray-600 hover:bg-gray-50'
                                     }`}
                             >
                                 <div className="flex justify-between items-center">
