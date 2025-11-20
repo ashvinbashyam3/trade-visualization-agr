@@ -1,9 +1,24 @@
-import { read, utils } from 'xlsx';
+import { read, utils, WorkBook } from 'xlsx';
 import { Trade, Position, DashboardData, PortfolioState, PositionHistoryPoint } from '../types/trade';
 
 const EUR_TO_USD = 1.17;
 
-// Helper to parse Excel dates
+/**
+ * Represents a tax lot for HIFO accounting.
+ */
+interface TaxLot {
+    date: string;
+    shares: number;
+    costPerShare: number; // Includes fees/commissions allocated
+    totalCost: number;
+}
+
+/**
+ * Helper to parse Excel dates into YYYY-MM-DD string format.
+ * Handles both Excel serial numbers and date strings.
+ * @param dateVal - The raw date value from Excel.
+ * @returns The formatted date string or empty string if invalid.
+ */
 const parseExcelDate = (dateVal: any): string => {
     if (!dateVal) return '';
     if (typeof dateVal === 'number') {
@@ -17,7 +32,12 @@ const parseExcelDate = (dateVal: any): string => {
     return '';
 };
 
-// Helper to find column name case-insensitively
+/**
+ * Helper to find a column name in a row object case-insensitively.
+ * @param row - The row object (key-value pairs).
+ * @param candidates - List of possible column names.
+ * @returns The actual key found in the row, or undefined.
+ */
 const findCol = (row: any, candidates: string[]): string | undefined => {
     const keys = Object.keys(row);
     for (const cand of candidates) {
@@ -27,14 +47,37 @@ const findCol = (row: any, candidates: string[]): string | undefined => {
     return undefined;
 };
 
-interface TaxLot {
-    date: string;
-    shares: number;
-    costPerShare: number; // Includes fees/commissions allocated
-    totalCost: number;
-}
+/**
+ * Parses a financial number from Excel which might be a number or a string with currency symbols/parentheses.
+ * Handles negative values represented by parentheses (e.g., "(1,000)").
+ * @param val - The raw value.
+ * @returns The parsed number.
+ */
+const parseFinancialNumber = (val: any): number => {
+    if (typeof val === 'number') return val;
+    if (typeof val === 'string') {
+        const isNegative = val.includes('(') || val.includes('-');
+        const num = parseFloat(val.replace(/[$,()]/g, '')) || 0;
+        return isNegative ? -Math.abs(num) : num;
+    }
+    return 0;
+};
 
-// --- ARGX Helpers ---
+/**
+ * Cleans and trims a ticker symbol to ensure consistency.
+ * @param val - The raw ticker string.
+ * @returns The cleaned ticker.
+ */
+const cleanTicker = (val: any): string => {
+    return val ? String(val).trim() : '';
+};
+
+/**
+ * Determines if an ARGX trade is for Ordinary shares (requiring EUR->USD conversion).
+ * @param desc - Security description.
+ * @param currency - Currency code.
+ * @returns True if it's an ORD share.
+ */
 const isArgxOrd = (desc: string, currency: string): boolean => {
     const d = (desc || '').toUpperCase();
     const c = (currency || '').toUpperCase();
@@ -43,7 +86,12 @@ const isArgxOrd = (desc: string, currency: string): boolean => {
     return isOrdDesc || isEur;
 };
 
-// --- Option Helpers ---
+/**
+ * Checks if a security is an Option based on ticker or description patterns.
+ * @param ticker - The ticker symbol.
+ * @param desc - The security description.
+ * @returns True if identified as an option.
+ */
 const isOption = (ticker: string, desc: string): boolean => {
     const t = (ticker || '').toUpperCase();
     const d = (desc || '').toUpperCase();
@@ -63,22 +111,29 @@ const isOption = (ticker: string, desc: string): boolean => {
     return false;
 };
 
+/**
+ * Generates a unique identifier for a security.
+ * For options, uses the sanitized description to distinguish them.
+ * For equities, uses the cleaned ticker.
+ * @param ticker - Raw ticker.
+ * @param desc - Description.
+ * @returns Unique identifier string.
+ */
 const getUniqueTicker = (ticker: string, desc: string): string => {
-    // If it's an option, use the Description as the unique ID (sanitized)
-    // Otherwise use the Ticker
     if (isOption(ticker, desc)) {
         // Clean up description to be a valid ID but readable
-        // e.g. "RYTM US 07/18/25 C25" -> "RYTM 07/18/25 C25"
         return desc.trim();
     }
-    return ticker.replace('_PIPE', '');
+    return ticker.replace('_PIPE', '').trim();
 };
 
-export const parseTradeData = async (file: File): Promise<DashboardData> => {
-    const data = await file.arrayBuffer();
-    const workbook = read(data);
-
-    // --- 1. Parse Trade Blotter ---
+/**
+ * Parses the Trade Blotter sheet to extract raw trades.
+ * Applies filtering for FX and EURUSD.
+ * @param workbook - The Excel workbook.
+ * @returns Array of parsed Trade objects.
+ */
+const parseTradeBlotter = (workbook: WorkBook): Trade[] => {
     const tradeSheetName = workbook.SheetNames.find(n =>
         n.toLowerCase().includes('trade blotter') ||
         n.toLowerCase().includes('itd trade') ||
@@ -88,11 +143,11 @@ export const parseTradeData = async (file: File): Promise<DashboardData> => {
     const tradeSheet = workbook.Sheets[tradeSheetName];
     const tradeJson: any[] = utils.sheet_to_json(tradeSheet);
 
-    let trades: Trade[] = [];
+    const trades: Trade[] = [];
 
     tradeJson.forEach((row: any) => {
         const tradeId = row['Trade Id'];
-        let rawTicker = row['Ticker'] || '';
+        const rawTicker = cleanTicker(row['Ticker']);
         const txnType = row['Txn Type'] || '';
         const description = row['Description'] || '';
 
@@ -107,47 +162,13 @@ export const parseTradeData = async (file: File): Promise<DashboardData> => {
         if (tickerUpper === 'EURUSD') return;
         if (tickerUpper === 'USDEUR') return;
 
-        // Determine Unique Ticker (Segregating Options)
         const ticker = getUniqueTicker(rawTicker, description);
-
-        let currency = row['Price Currency'] || row['Currency'] || 'USD';
-        let price = parseFloat(row['Trade Price']) || 0;
-
-        let netProceedsStr = row['$ Trading Net Proceeds'];
-        let netProceeds = 0;
-        if (typeof netProceedsStr === 'number') {
-            netProceeds = netProceedsStr;
-        } else if (typeof netProceedsStr === 'string') {
-            const isNegative = netProceedsStr.includes('(') || netProceedsStr.includes('-');
-            netProceeds = parseFloat(netProceedsStr.replace(/[$,()]/g, '')) || 0;
-            if (isNegative) netProceeds = -Math.abs(netProceeds);
-        }
-
-        let quantityStr = row['Notional Quantity'];
-        let quantity = 0;
-        if (typeof quantityStr === 'number') {
-            quantity = quantityStr;
-        } else if (typeof quantityStr === 'string') {
-            quantity = parseFloat(quantityStr.replace(/,/g, '')) || 0;
-        }
-        quantity = Math.abs(quantity);
-
-        let feesStr = row['Fees'];
-        let fees = 0;
-        if (typeof feesStr === 'number') fees = feesStr;
-        else if (typeof feesStr === 'string') {
-            fees = parseFloat(feesStr.replace(/[$,()]/g, '')) || 0;
-            if (feesStr.includes('(')) fees = -Math.abs(fees);
-        }
-
-        let commStr = row['Gross Commissions'];
-        let commissions = 0;
-        if (typeof commStr === 'number') commissions = commStr;
-        else if (typeof commStr === 'string') {
-            commissions = parseFloat(commStr.replace(/[$,()]/g, '')) || 0;
-            if (commStr.includes('(')) commissions = -Math.abs(commissions);
-        }
-
+        const currency = row['Price Currency'] || row['Currency'] || 'USD';
+        const price = parseFloat(row['Trade Price']) || 0;
+        const netProceeds = parseFinancialNumber(row['$ Trading Net Proceeds']);
+        const quantity = Math.abs(parseFinancialNumber(row['Notional Quantity']));
+        const fees = parseFinancialNumber(row['Fees']);
+        const commissions = parseFinancialNumber(row['Gross Commissions']);
         const tradeDate = parseExcelDate(row['Trade Date']);
 
         trades.push({
@@ -165,13 +186,21 @@ export const parseTradeData = async (file: File): Promise<DashboardData> => {
         });
     });
 
-    // --- 1.5 Consolidate ARGX Trades ---
+    return trades;
+};
+
+/**
+ * Consolidates ARGX trades (ORD and ADR) into a single 'ARGX' ticker.
+ * Converts EUR prices to USD for ORD shares.
+ * @param trades - List of all trades.
+ * @returns List of trades with ARGX consolidated.
+ */
+const consolidateArgxTrades = (trades: Trade[]): Trade[] => {
     const argxTrades: Trade[] = [];
     const otherTrades: Trade[] = [];
 
     trades.forEach(t => {
         if (t.ticker === 'ARGX') {
-            // Convert Price to USD if ORD
             if (isArgxOrd(t.description, t.currency)) {
                 t.price = t.price * EUR_TO_USD;
                 t.currency = 'USD';
@@ -182,7 +211,7 @@ export const parseTradeData = async (file: File): Promise<DashboardData> => {
         }
     });
 
-    // Group ARGX by Date + Side
+    // Group ARGX by Date + Side to create weighted average trades
     const argxGrouped: Record<string, {
         shares: number;
         cashFlowUsd: number;
@@ -207,8 +236,8 @@ export const parseTradeData = async (file: File): Promise<DashboardData> => {
 
         if (grp.shares > 0) {
             const weightedPrice = grp.cashFlowUsd / grp.shares;
-
             const baseTrade = grp.trades[0];
+
             consolidatedArgx.push({
                 ...baseTrade,
                 tradeId: `ARGX-CONS-${date}-${txnType}`,
@@ -224,11 +253,17 @@ export const parseTradeData = async (file: File): Promise<DashboardData> => {
         }
     });
 
-    trades = [...otherTrades, ...consolidatedArgx];
-    trades.sort((a, b) => new Date(a.tradeDate).getTime() - new Date(b.tradeDate).getTime());
+    const finalTrades = [...otherTrades, ...consolidatedArgx];
+    finalTrades.sort((a, b) => new Date(a.tradeDate).getTime() - new Date(b.tradeDate).getTime());
+    return finalTrades;
+};
 
-
-    // --- 2. Parse History Sheet (for AUM and Prices) ---
+/**
+ * Parses the History Sheet to extract daily AUM, prices, and the last seen date for each ticker.
+ * @param workbook - The Excel workbook.
+ * @returns Object containing dailyAumMap, dailyPriceMap, lastHistoryDateMap, and historyDates set.
+ */
+const parseHistorySheet = (workbook: WorkBook) => {
     const histSheetName = workbook.SheetNames.find(n =>
         n.toLowerCase().includes('itd history') ||
         n.toLowerCase().includes('daily portfolio') ||
@@ -236,8 +271,8 @@ export const parseTradeData = async (file: File): Promise<DashboardData> => {
     );
 
     const dailyAumMap: Record<string, number> = {};
-    const dailyPriceMap: Record<string, Record<string, number>> = {}; // Date -> Ticker -> Price
-    const lastHistoryDateMap: Record<string, string> = {}; // Ticker -> Last Date seen in History
+    const dailyPriceMap: Record<string, Record<string, number>> = {};
+    const lastHistoryDateMap: Record<string, string> = {};
     const historyDates = new Set<string>();
 
     if (histSheetName) {
@@ -263,39 +298,17 @@ export const parseTradeData = async (file: File): Promise<DashboardData> => {
 
                 historyDates.add(date);
 
-                let rawTicker = '';
-                if (tickerCol && row[tickerCol]) {
-                    rawTicker = row[tickerCol];
-                }
+                const rawTicker = cleanTicker(row[tickerCol]);
                 const description = descCol ? row[descCol] : '';
 
-                // Filter FX from History too
+                // Filter FX
                 if (rawTicker.toUpperCase().includes('FX SPOT')) return;
                 if (rawTicker.toUpperCase() === 'EURUSD') return;
 
-                // Determine Unique Ticker (Segregating Options)
                 const ticker = getUniqueTicker(rawTicker, description);
-
-                let mv = 0;
-                if (mvCol) {
-                    let val = row[mvCol];
-                    if (typeof val === 'string') val = parseFloat(val.replace(/[$,()]/g, '')) || 0;
-                    if (typeof val === 'number') mv = val;
-                }
-
-                let price = 0;
-                if (priceCol) {
-                    let val = row[priceCol];
-                    if (typeof val === 'string') val = parseFloat(val.replace(/[$,()]/g, '')) || 0;
-                    if (typeof val === 'number') price = val;
-                }
-
-                let qty = 0;
-                if (qtyCol) {
-                    let val = row[qtyCol];
-                    if (typeof val === 'string') val = parseFloat(val.replace(/[$,()]/g, '')) || 0;
-                    if (typeof val === 'number') qty = val;
-                }
+                const mv = mvCol ? parseFinancialNumber(row[mvCol]) : 0;
+                const price = priceCol ? parseFinancialNumber(row[priceCol]) : 0;
+                const qty = qtyCol ? parseFinancialNumber(row[qtyCol]) : 0;
 
                 // Update Last History Date if position exists
                 if (Math.abs(qty) > 0.000001 || Math.abs(mv) > 0.01) {
@@ -305,13 +318,11 @@ export const parseTradeData = async (file: File): Promise<DashboardData> => {
                     }
                 }
 
-                // --- ARGX Special Handling ---
+                // ARGX Special Handling
                 if (ticker === 'ARGX') {
                     const isOrd = isArgxOrd(description, '');
-
                     let pxUsd = price;
                     if (isOrd) pxUsd = price * EUR_TO_USD;
-
                     const mvUsd = Math.abs(qty) * pxUsd;
 
                     if (!argxDaily[date]) {
@@ -324,13 +335,10 @@ export const parseTradeData = async (file: File): Promise<DashboardData> => {
                     else agg.adrPx = pxUsd;
 
                     dailyAumMap[date] = (dailyAumMap[date] || 0) + mvUsd;
-
                 } else {
-                    // Normal Ticker (or Option)
                     if (mvCol) {
                         dailyAumMap[date] = (dailyAumMap[date] || 0) + mv;
                     }
-
                     if (ticker && price > 0) {
                         if (!dailyPriceMap[date]) dailyPriceMap[date] = {};
                         dailyPriceMap[date][ticker] = price;
@@ -342,7 +350,6 @@ export const parseTradeData = async (file: File): Promise<DashboardData> => {
             Object.keys(argxDaily).forEach(date => {
                 const agg = argxDaily[date];
                 let finalPrice = 0;
-
                 if (agg.totQty > 0 && agg.totMvUsd > 0) {
                     finalPrice = agg.totMvUsd / agg.totQty;
                 } else if (agg.adrPx > 0) {
@@ -358,27 +365,20 @@ export const parseTradeData = async (file: File): Promise<DashboardData> => {
             });
         }
     }
+    return { dailyAumMap, dailyPriceMap, lastHistoryDateMap, historyDates };
+};
 
-    // --- 3. Build Master Timeline ---
-    const tradeDates = new Set(trades.map(t => t.tradeDate));
-    const allDates = Array.from(new Set([...Array.from(tradeDates), ...Array.from(historyDates)]));
-    allDates.sort((a, b) => new Date(a).getTime() - new Date(b).getTime());
-
-    // --- 4. Simulation Loop ---
+/**
+ * Simulates the portfolio day-by-day to calculate holdings, P&L, and AUM.
+ * Uses HIFO (Highest-In, First-Out) accounting for sales.
+ */
+const simulatePortfolio = (
+    allDates: string[],
+    trades: Trade[],
+    dailyPriceMap: Record<string, Record<string, number>>,
+    dailyAumMap: Record<string, number>
+) => {
     const portfolioHistory: PortfolioState[] = [];
-    const positionsMap: Record<string, Position> = {};
-
-    let currentCash = 0;
-    const currentHoldings: Record<string, { shares: number; price: number }> = {};
-
-    const tradesByDate: Record<string, Trade[]> = {};
-    trades.forEach(t => {
-        if (!t.tradeDate) return;
-        if (!tradesByDate[t.tradeDate]) tradesByDate[t.tradeDate] = [];
-        tradesByDate[t.tradeDate].push(t);
-    });
-
-    // Track state for HIFO and Metrics
     const positionStates: Record<string, {
         shares: number;
         lots: TaxLot[];
@@ -388,6 +388,17 @@ export const parseTradeData = async (file: File): Promise<DashboardData> => {
         daysPresent: number;
         maxSizePercentAUM: number;
     }> = {};
+
+    let currentCash = 0;
+    const currentHoldings: Record<string, { shares: number; price: number }> = {};
+
+    // Group trades by date for faster access
+    const tradesByDate: Record<string, Trade[]> = {};
+    trades.forEach(t => {
+        if (!t.tradeDate) return;
+        if (!tradesByDate[t.tradeDate]) tradesByDate[t.tradeDate] = [];
+        tradesByDate[t.tradeDate].push(t);
+    });
 
     allDates.forEach((date, dateIdx) => {
         // A. Process Trades for this date
@@ -416,11 +427,9 @@ export const parseTradeData = async (file: File): Promise<DashboardData> => {
                     if (dateIdx > 0) {
                         const prevDate = allDates[dateIdx - 1];
                         let startPrice = trade.price;
-                        // Try to get historical price for the buffer day to avoid scaling issues
                         if (dailyPriceMap[prevDate] && dailyPriceMap[prevDate][trade.ticker]) {
                             startPrice = dailyPriceMap[prevDate][trade.ticker];
                         }
-
                         positionStates[trade.ticker].history.push({
                             date: prevDate,
                             price: startPrice,
@@ -501,7 +510,6 @@ export const parseTradeData = async (file: File): Promise<DashboardData> => {
         }
 
         // C. Determine AUM
-        // Prefer History AUM, fallback to calculated
         let aum = dailyAumMap[date];
         if (!aum) {
             let holdingsValue = 0;
@@ -548,12 +556,10 @@ export const parseTradeData = async (file: File): Promise<DashboardData> => {
 
             // Update Size Metrics
             const sizePercent = aum > 0 ? (marketValue / aum) * 100 : 0;
-
             if (sizePercent > posState.maxSizePercentAUM) {
                 posState.maxSizePercentAUM = sizePercent;
             }
 
-            // Only count days where position is active
             if (Math.abs(posState.shares) > 0.00001) {
                 posState.sumSizePercentAUM += sizePercent;
                 posState.daysPresent += 1;
@@ -561,8 +567,20 @@ export const parseTradeData = async (file: File): Promise<DashboardData> => {
         });
     });
 
-    // --- 5. Finalize Positions ---
-    const lastDate = allDates[allDates.length - 1];
+    return { portfolioHistory, positionStates, currentHoldings };
+};
+
+/**
+ * Finalizes position data, calculates final metrics, and trims history.
+ * Applies the logic to extend X-axis based on History sheet presence.
+ */
+const finalizePositions = (
+    positionStates: Record<string, any>,
+    currentHoldings: Record<string, any>,
+    trades: Trade[],
+    lastHistoryDateMap: Record<string, string>
+): Position[] => {
+    const positionsMap: Record<string, Position> = {};
 
     Object.keys(positionStates).forEach(ticker => {
         const posState = positionStates[ticker];
@@ -588,7 +606,7 @@ export const parseTradeData = async (file: File): Promise<DashboardData> => {
         // Final Avg Cost
         let totalLotCost = 0;
         let totalLotShares = 0;
-        posState.lots.forEach(l => {
+        posState.lots.forEach((l: TaxLot) => {
             totalLotCost += l.totalCost;
             totalLotShares += l.shares;
         });
@@ -612,34 +630,28 @@ export const parseTradeData = async (file: File): Promise<DashboardData> => {
         }
 
         // Also check Last History Date (from History Sheet)
-        // If the History sheet says we held it on date X, we must include date X.
         let lastHistoryIndex = -1;
         const lastHistDate = lastHistoryDateMap[ticker];
         if (lastHistDate) {
-            lastHistoryIndex = posState.history.findIndex(h => h.date === lastHistDate);
+            lastHistoryIndex = posState.history.findIndex((h: any) => h.date === lastHistDate);
         }
 
-        // The cut-off should be the MAX of (Last Active Trade-based Index) and (Last History-based Index)
         const finalIndex = Math.max(lastActiveIndex, lastHistoryIndex);
 
         if (finalIndex >= 0) {
             const sliceEnd = Math.min(posState.history.length, finalIndex + 2);
             pos.history = posState.history.slice(0, sliceEnd);
         } else {
-            // If never active and no history?
             pos.history = posState.history;
         }
 
         pos.maxSizePercentAUM = posState.maxSizePercentAUM;
         pos.avgSizePercentAUM = posState.daysPresent > 0 ? posState.sumSizePercentAUM / posState.daysPresent : 0;
 
-        // Filtering Logic:
-        // Include if: Avg Size >= 1% OR Currently Held
+        // Filtering Logic
         const isCurrentlyHeld = Math.abs(pos.shares) > 0.00001;
         const isSignificant = pos.avgSizePercentAUM >= 1.0;
 
-        // isSmallPosition = TRUE means it will be HIDDEN by default
-        // So if it matches criteria, isSmallPosition should be FALSE
         if (isSignificant || isCurrentlyHeld) {
             pos.isSmallPosition = false;
         } else {
@@ -647,8 +659,44 @@ export const parseTradeData = async (file: File): Promise<DashboardData> => {
         }
     });
 
+    return Object.values(positionsMap);
+};
+
+/**
+ * Main function to parse trade data and generate dashboard data.
+ * Orchestrates the parsing of Blotter, History, and the Simulation loop.
+ * @param file - The Excel file uploaded by the user.
+ * @returns Promise resolving to DashboardData.
+ */
+export const parseTradeData = async (file: File): Promise<DashboardData> => {
+    const data = await file.arrayBuffer();
+    const workbook = read(data);
+
+    // 1. Parse and Consolidate Trades
+    let trades = parseTradeBlotter(workbook);
+    trades = consolidateArgxTrades(trades);
+
+    // 2. Parse History Sheet
+    const { dailyAumMap, dailyPriceMap, lastHistoryDateMap, historyDates } = parseHistorySheet(workbook);
+
+    // 3. Build Master Timeline
+    const tradeDates = new Set(trades.map(t => t.tradeDate));
+    const allDates = Array.from(new Set([...Array.from(tradeDates), ...Array.from(historyDates)]));
+    allDates.sort((a, b) => new Date(a).getTime() - new Date(b).getTime());
+
+    // 4. Run Simulation
+    const { portfolioHistory, positionStates, currentHoldings } = simulatePortfolio(
+        allDates,
+        trades,
+        dailyPriceMap,
+        dailyAumMap
+    );
+
+    // 5. Finalize Positions
+    const positions = finalizePositions(positionStates, currentHoldings, trades, lastHistoryDateMap);
+
     return {
-        positions: Object.values(positionsMap),
+        positions,
         portfolioHistory,
         trades
     };
